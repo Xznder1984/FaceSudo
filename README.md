@@ -72,7 +72,7 @@ facesudo/
   log.py            local match-attempt log (timestamps + outcome only)
   sudo_bridge.py    pty bridge that answers the sudo prompt with the Keychain password
   cli.py            CLI: enroll / verify / auth / status / config / test-camera ...
-  gui.py            PyQt6 settings + guided enrollment
+  gui.py            PyQt6 settings + guided enrollment + guided match window
   menu.py           rumps menu-bar app (quick enable/disable)
   install.sh        venv + models + launchers + .zshrc wrapper
 ```
@@ -104,6 +104,22 @@ An enabled layer must **pass**. A layer that can't compute its cue (e.g. no
 background features) counts as *N/A* → passes, so a flaky heuristic never
 locks you out. If one layer is too sensitive for your webcam, disable it in
 the GUI.
+
+### Guided camera flow
+
+When `match_gui` is enabled (default), `sudo` and `facesudo verify` open a
+live camera window that walks you through each step in real time:
+
+1. **Looking for your face** — live preview with a green box once detected.
+2. **"Now blink naturally"** — counts each blink as it happens.
+3. **"Turn your head to the left/right"** — live `yaw` readout on your face
+   and "good, hold the turn" once the swing is seen.
+4. **Matching** — per-layer PASS/FAIL shown, then the result.
+
+The same flow runs in the terminal when `match_gui` is off or Qt is
+unavailable. Liveness analysis always runs on a downscaled 320 px pipeline so
+the whole attempt stays fast even on a low-power Intel CPU; texture analysis
+still uses the full-resolution frame.
 
 ## Requirements
 
@@ -193,6 +209,7 @@ Otherwise you get the normal password prompt.
 | `lowlight_strength` | `1.0` | 0–2 enhancement strength |
 | `camera_index` | `0` | capture device |
 | `ir_camera` | `false` | set `true` if using an external IR webcam |
+| `match_gui` | `true` | use the guided camera window for sudo / verify |
 | `liveness_*` | `true` | per-layer spoof-detection switches |
 
 CLI: `facesudo config threshold=0.5 liveness_head_turn=0`

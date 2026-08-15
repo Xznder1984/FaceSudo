@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 
 import cv2
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 from . import keychain
 from .config import Config
 from .log import MatchLog
+from .matcher import CancelFlag, MatchSession
 from .storage import EncodingStore
 
 LIVENESS_LABELS = [
@@ -148,6 +149,10 @@ class SettingsWindow(QMainWindow):
         shl.addWidget(self.strength_label)
         form.addRow("Enhancement strength", srow)
 
+        self.gui_match_cb = QCheckBox("Use the guided camera window for sudo / verify")
+        self.gui_match_cb.setChecked(self.cfg.match_gui)
+        form.addRow("", self.gui_match_cb)
+
         self.liveness_cbs = {}
         form.addRow("Spoof-detection layers", QLabel("(uncheck any that are too sensitive on your webcam)"))
         for key, label in LIVENESS_LABELS:
@@ -240,6 +245,7 @@ class SettingsWindow(QMainWindow):
             liveness_texture=self.liveness_cbs["texture"].isChecked(),
             liveness_micro_motion=self.liveness_cbs["micro_motion"].isChecked(),
             liveness_parallax=self.liveness_cbs["parallax"].isChecked(),
+            match_gui=self.gui_match_cb.isChecked(),
         )
         self.status_label.setText("Settings saved.")
         self._refresh_status()
@@ -416,6 +422,156 @@ class EnrollmentWindow(QDialog):
         if getattr(self, "camera", None) is not None:
             self.camera.release()
         super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Guided match window (live camera that walks you through each step)
+# ---------------------------------------------------------------------------
+
+class _GuiSession(MatchSession):
+    """Routes session callbacks from the worker thread to Qt signals."""
+
+    def __init__(self, worker, cancel_flag) -> None:
+        self.worker = worker
+        self.cancel_flag = cancel_flag
+
+    def prompt(self, message: str) -> None:
+        self.worker.prompt_signal.emit(message)
+
+    def feedback(self, message: str) -> None:
+        self.worker.feedback_signal.emit(message)
+
+    def preview(self, frame_bgr, box=None, yaw=None) -> None:
+        self.worker.preview_signal.emit(frame_bgr, box, yaw)
+
+    def cancelled(self) -> bool:
+        return self.cancel_flag.is_set()
+
+
+class _MatchWorker(QThread):
+    preview_signal = pyqtSignal(object, object, object)  # frame, box, yaw
+    prompt_signal = pyqtSignal(str)
+    feedback_signal = pyqtSignal(str)
+    done_signal = pyqtSignal(object)  # MatchResult
+
+    def __init__(self, cfg: Config, cancel_flag, parent=None) -> None:
+        super().__init__(parent)
+        self.cfg = cfg
+        self.cancel_flag = cancel_flag
+
+    def run(self) -> None:
+        from .matcher import MatchResult, run_match_with_session
+        from .runtime import build_engine, build_predictor
+        from .storage import EncodingStore
+
+        session = _GuiSession(self, self.cancel_flag)
+        try:
+            engine = build_engine()
+            predictor = build_predictor()
+            result = run_match_with_session(
+                self.cfg, EncodingStore(), engine, predictor, session)
+        except Exception as e:  # never let the window hang on a crash
+            result = MatchResult(reason=f"error: {e}")
+        self.done_signal.emit(result)
+
+
+class MatchWindow(QDialog):
+    """Live preview + step instructions + real-time feedback + cancel."""
+
+    def __init__(self, cfg: Config, parent=None) -> None:
+        super().__init__(parent)
+        self.cfg = cfg
+        self.result = None
+        self.worker: _MatchWorker | None = None
+        self._cancel = CancelFlag()
+
+        self.setWindowTitle("FaceSudo - guided match")
+        self.resize(580, 560)
+
+        layout = QVBoxLayout(self)
+
+        self.preview = QLabel("starting camera...")
+        self.preview.setMinimumSize(480, 320)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.preview, 1)
+
+        self.step = QLabel("")
+        self.step.setWordWrap(True)
+        self.step.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(self.step)
+
+        self.feedback = QLabel("")
+        self.feedback.setWordWrap(True)
+        layout.addWidget(self.feedback)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        layout.addWidget(self.cancel_btn)
+
+    def start(self) -> None:
+        self.worker = _MatchWorker(self.cfg, self._cancel, self)
+        self.worker.preview_signal.connect(self._on_preview)
+        self.worker.prompt_signal.connect(self._on_prompt)
+        self.worker.feedback_signal.connect(self.feedback.setText)
+        self.worker.done_signal.connect(self._on_done)
+        self.worker.start()
+
+    def _on_preview(self, frame_bgr, box, yaw) -> None:
+        if frame_bgr is None:
+            return
+        display = frame_bgr
+        if box is not None:
+            display = frame_bgr.copy()
+            top, right, bottom, left = box
+            cv2.rectangle(display, (left, top), (right, bottom), (0, 255, 0), 2)
+            if yaw is not None:
+                cv2.putText(display, f"yaw {yaw:+.2f}", (left, top - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        self.preview.setPixmap(_bgr_to_pixmap(display).scaled(
+            self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    def _on_prompt(self, message: str) -> None:
+        self.step.setText(message)
+
+    def _on_cancel(self) -> None:
+        self._cancel.cancel()
+        self.cancel_btn.setEnabled(False)
+        self.step.setText("Cancelling...")
+
+    def _on_done(self, result) -> None:
+        self.result = result
+        if result.ok:
+            self.step.setText("MATCHED")
+            self.feedback.setText(f"{result.reason}\n{result.summary()}")
+        else:
+            self.step.setText("NOT MATCHED")
+            self.feedback.setText(f"{result.reason}\n{result.summary()}")
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.clicked.disconnect()
+        self.cancel_btn.setText("Close")
+        self.cancel_btn.clicked.connect(self.accept)
+        QTimer.singleShot(2000, self.accept)
+
+    def closeEvent(self, event) -> None:
+        self._cancel.cancel()
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait(5000)
+        super().closeEvent(event)
+
+
+def run_match_dialog(cfg: Config):
+    """Run the guided match window to completion; return the MatchResult or
+    None if the user cancelled / no result was produced."""
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    win = MatchWindow(cfg)
+    win.start()
+    win.exec()
+    return win.result
 
 
 def main() -> int:

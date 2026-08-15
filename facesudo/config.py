@@ -24,6 +24,7 @@ DEFAULTS = {
     "lowlight_strength": 1.0,   # 0.0 - 2.0 multiplier for CLAHE/denoise params
     "camera_index": 0,
     "ir_camera": False,         # set True if using an external IR webcam
+    "match_gui": True,          # use the guided camera window for sudo/verify
     "liveness": {
         "blink": True,
         "head_turn": True,
@@ -75,6 +76,10 @@ class Config:
     def ir_camera(self) -> bool:
         return bool(self._data.get("ir_camera", DEFAULTS["ir_camera"]))
 
+    @property
+    def match_gui(self) -> bool:
+        return bool(self._data.get("match_gui", DEFAULTS["match_gui"]))
+
     def liveness_enabled(self, layer: str) -> bool:
         layers = self._data.get("liveness", {})
         return bool(layers.get(layer, DEFAULTS["liveness"].get(layer, True)))
@@ -117,6 +122,8 @@ class Config:
                 self._data["camera_index"] = int(v)
             elif k == "ir_camera":
                 self._data["ir_camera"] = bool(v)
+            elif k == "match_gui":
+                self._data["match_gui"] = bool(v)
             elif k.startswith("liveness_"):
                 layer = k[len("liveness_"):]
                 if layer in _LIVENESS_KEYS:

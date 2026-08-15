@@ -26,7 +26,7 @@ import cv2
 from . import keychain
 from .config import Config
 from .log import MatchLog
-from .matcher import PromptUI, run_match
+from .matcher import run_match
 from .storage import EncodingStore
 from .sudo_bridge import SUDO_BIN, bridge_sudo, exec_sudo_plain
 from .recognition import engine_status
@@ -124,6 +124,19 @@ def cmd_verify(cfg: Config, args) -> int:
     if engine_status().startswith("unavailable"):
         print("recognition engine unavailable (dlib did not import)", file=sys.stderr)
         return 2
+
+    if args.gui:
+        try:
+            from .gui import run_match_dialog
+
+            result = run_match_dialog(cfg)
+            if result is not None:
+                print(f"{'PASS' if result.ok else 'FAIL'}: {result.reason}")
+                print(result.summary())
+                return 0 if result.ok else 1
+        except Exception as e:
+            print(f"GUI match unavailable ({e}); falling back to terminal.", file=sys.stderr)
+
     engine, predictor = _build()
     store = EncodingStore()
     print(f"FaceSudo verify (engine={engine_status()}, detector={engine.detector_name})")
@@ -154,9 +167,23 @@ def cmd_auth(cfg: Config, args) -> int:
     if check.returncode == 0:
         return exec_sudo_plain(rest)
 
-    engine, predictor = _build()
-    store = EncodingStore()
-    result = run_match(cfg, store, engine, predictor)
+    result = None
+    if cfg.match_gui:
+        try:
+            from .gui import run_match_dialog
+
+            result = run_match_dialog(cfg)
+        except Exception as e:
+            print(f"[FaceSudo] guided window unavailable ({e}); using terminal flow.",
+                  file=sys.stderr)
+        if result is None:
+            print("[FaceSudo] match cancelled; password prompt.", file=sys.stderr)
+            return exec_sudo_plain(rest)
+    else:
+        engine, predictor = _build()
+        store = EncodingStore()
+        result = run_match(cfg, store, engine, predictor)
+
     if result.ok:
         password = keychain.get_sudo_password()
         if not password:
@@ -190,7 +217,7 @@ def cmd_status(cfg: Config, args) -> int:
 
 def cmd_config(cfg: Config, args) -> int:
     keys = ("enabled", "threshold", "timeout", "lowlight", "lowlight_strength",
-            "camera_index", "ir_camera",
+            "camera_index", "ir_camera", "match_gui",
             "liveness_blink", "liveness_head_turn", "liveness_texture",
             "liveness_micro_motion", "liveness_parallax")
     if not args.set:
@@ -215,7 +242,7 @@ def cmd_config(cfg: Config, args) -> int:
         if k not in keys:
             print(f"unknown key: {k}", file=sys.stderr)
             return 1
-        if k in ("enabled", "ir_camera", "lowlight") or k.startswith("liveness_"):
+        if k in ("enabled", "ir_camera", "lowlight", "match_gui") or k.startswith("liveness_"):
             updates[k] = v in ("1", "true", "True", "yes", "on")
         elif k in ("threshold",):
             updates[k] = float(v)
@@ -348,6 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("verify", help="one-shot match test")
     v.add_argument("--timeout", type=int, default=None)
+    v.add_argument("--gui", action="store_true", help="use the guided camera window")
     v.set_defaults(fn=cmd_verify)
 
     a = sub.add_parser("auth", help="zsh wrapper entry (not for manual use)")

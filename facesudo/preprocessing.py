@@ -58,6 +58,16 @@ def enhance_single(frame: np.ndarray, enabled: bool, strength: float = 1.0) -> n
     return clahe_color(denoise(frame, h=h), clip_limit=clip, tile=8)
 
 
+def enhance_quick(frame: np.ndarray, enabled: bool, strength: float = 1.0) -> np.ndarray:
+    """CLAHE-only pass for live preview / per-frame feedback, where the
+    fastNLM denoise step would be too slow on a low-power CPU."""
+    if not enabled or strength <= 0.0:
+        return frame
+    strength = max(0.1, min(2.0, strength))
+    clip = 1.2 + 0.8 * strength
+    return clahe_color(frame, clip_limit=clip, tile=8)
+
+
 def enhance(frames: list[np.ndarray], enabled: bool, strength: float = 1.0) -> np.ndarray:
     """Full low-light pipeline. `strength` scales CLAHE clip and denoise h.
 

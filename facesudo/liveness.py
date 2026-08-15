@@ -8,9 +8,16 @@ Layers (each independently toggleable in the GUI):
   micro_motion  - internal vs rigid optical-flow signature inside the face box
   parallax      - background-vs-face displacement cue during head motion (best-effort)
 
-Policy: an enabled layer must return PASS. N/A (e.g. the cue couldn't be
-computed) counts as PASS so a flaky heuristic never locks the user out --
-the whole matcher always falls back to the password prompt anyway.
+Design notes:
+  - Detection / landmarks / optical flow run on frames downscaled to
+    LIVENESS_WIDTH so the pipeline stays fast even on low-power Intel CPUs
+    (e.g. the MacBook Air 2018 i5-8210Y). Texture uses the full-res patch.
+  - Blink uses an adaptive baseline (median EAR/openness of the session)
+    instead of fixed thresholds, because fixed thresholds fail across
+    camera models, lighting, and face size.
+  - Policy: an enabled layer must return PASS. N/A (cue couldn't be
+    computed) counts as PASS so a flaky heuristic never locks the user out --
+    the whole matcher always falls back to the password prompt anyway.
 """
 
 from __future__ import annotations
@@ -22,6 +29,8 @@ import dlib
 import numpy as np
 
 from .preprocessing import enhance_single
+
+LIVENESS_WIDTH = 320
 
 # 5-point model indices (bundled with face_recognition)
 P_LEFT_EYE = 0
@@ -55,10 +64,12 @@ class LayerResult:
 
 @dataclass
 class LivenessContext:
-    frames_enhanced: list[np.ndarray] = field(default_factory=list)  # BGR
-    boxes: list[tuple[int, int, int, int]] = field(default_factory=list)  # per frame
+    frames_small: list[np.ndarray] = field(default_factory=list)  # BGR downscaled
+    boxes: list[tuple[int, int, int, int]] = field(default_factory=list)  # small coords
     prompt_dir: str = ""  # "left" | "right" | ""
     landmarks: list = field(default_factory=list)  # per frame shape or None
+    full_res_frames: list[np.ndarray] = field(default_factory=list)  # for texture
+    scale: float = 1.0
 
 
 def _bbox_center(box) -> tuple[float, float]:
@@ -68,6 +79,37 @@ def _bbox_center(box) -> tuple[float, float]:
 
 def _dist(p, q) -> float:
     return float(np.hypot(p.x - q.x, p.y - q.y))
+
+
+def _to_width(bgr: np.ndarray, width: int = LIVENESS_WIDTH) -> tuple[np.ndarray, float]:
+    h, w = bgr.shape[:2]
+    if w <= width:
+        return bgr, 1.0
+    scale = width / w
+    nh = int(round(h * scale))
+    return cv2.resize(bgr, (width, nh), interpolation=cv2.INTER_AREA), scale
+
+
+def _scale_box(box, scale: float) -> tuple[int, int, int, int]:
+    top, right, bottom, left = box
+    return (int(top / scale), int(right / scale), int(bottom / scale), int(left / scale))
+
+
+def _largest(boxes):
+    if not boxes:
+        return None
+    return max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+
+
+def _prep_frames(frames_raw: list[np.ndarray], lowlight: bool, strength: float):
+    """Downscale + enhance each frame to LIVENESS_WIDTH once. Returns
+    (smalls_bgr, scales). Detection/landmarks/flow run on these smalls."""
+    smalls, scales = [], []
+    for f in frames_raw:
+        sm, sc = _to_width(f, LIVENESS_WIDTH)
+        smalls.append(enhance_single(sm, lowlight, strength))
+        scales.append(sc)
+    return smalls, scales
 
 
 def build_landmark_sets(frames_rgb, boxes, predictor):
@@ -87,7 +129,7 @@ def build_landmark_sets(frames_rgb, boxes, predictor):
 
 
 # ---------------------------------------------------------------------------
-# Blink detection
+# Blink detection (adaptive)
 # ---------------------------------------------------------------------------
 
 def _eye_openness_5pt(gray: np.ndarray, shape, box) -> float | None:
@@ -124,44 +166,57 @@ def _ear_68(shape) -> float:
     return (ear(_EYE68_LEFT) + ear(_EYE68_RIGHT)) / 2.0
 
 
-def check_blink(ctx: LivenessContext, predictor) -> LayerResult:
-    scores = []
-    for i, (frame, shape) in enumerate(zip(ctx.frames_enhanced, ctx.landmarks)):
-        if shape is None:
-            continue
-        if is_68_point(shape):
-            scores.append(_ear_68(shape))
-        else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            s = _eye_openness_5pt(gray, shape, ctx.boxes[i])
-            if s is not None:
-                scores.append(s)
-    if len(scores) < 4:
-        return LayerResult("blink", False, f"insufficient frames tracked ({len(scores)})")
+def openness_score(shape, gray) -> float | None:
+    """Single openness value: EAR for 68-point, darkness ratio for 5-point."""
+    if is_68_point(shape):
+        return _ear_68(shape)
+    return _eye_openness_5pt(gray, shape, None)
 
-    # EAR-style scores (68-point) are lower-magnitude than the 5-point
-    # openness score; pick thresholds from the dominant model.
-    uses_68 = sum(1 for s in ctx.landmarks if s is not None and is_68_point(s))
-    if uses_68 >= len(scores) // 2:
-        low, high = 0.22, 0.26
-    else:
-        low, high = 0.30, 0.48
 
+def _detect_blinks(scores: list[float], margin: float) -> tuple[int, float]:
+    """Adaptive open->closed->open cycle count around the median baseline."""
+    if not scores:
+        return 0, 0.0
+    baseline = float(np.median(scores))
+    closed = baseline - margin
+    reopen = baseline - margin * 0.4
     blinks = 0
     state = "init"
     for s in scores:
         if state == "init":
-            if s >= high:
+            if s >= closed:
                 state = "open"
         elif state == "open":
-            if s <= low:
+            if s < closed:
                 state = "closed"
         elif state == "closed":
-            if s >= high:
+            if s >= reopen:
                 blinks += 1
                 state = "open"
+    return blinks, baseline
+
+
+def check_blink(ctx: LivenessContext) -> LayerResult:
+    scores = []
+    uses_68 = False
+    for i, (small, shape) in enumerate(zip(ctx.frames_small, ctx.landmarks)):
+        if shape is None:
+            continue
+        if is_68_point(shape):
+            uses_68 = True
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        s = openness_score(shape, gray)
+        if s is not None:
+            scores.append(s)
+    if len(scores) < 4:
+        return LayerResult("blink", False, f"insufficient frames tracked ({len(scores)})")
+
+    margin = 0.08 if uses_68 else 0.15
+    blinks, baseline = _detect_blinks(scores, margin)
     ok = blinks >= 1
-    detail = f"blinks={blinks} min={min(scores):.2f} max={max(scores):.2f}"
+    spread = max(scores) - min(scores)
+    detail = (f"blinks={blinks} baseline={baseline:.2f} spread={spread:.2f} "
+              f"min={min(scores):.2f} max={max(scores):.2f}")
     return LayerResult("blink", ok, detail)
 
 
@@ -183,6 +238,49 @@ def _yaw_of_shape(shape) -> float:
     return (dl - dr) / (dl + dr + 1e-6)
 
 
+def frame_yaw(rgb, box, predictor) -> float | None:
+    shapes = build_landmark_sets([rgb], [box], predictor)
+    if shapes[0] is None:
+        return None
+    return _yaw_of_shape(shapes[0])
+
+
+def quick_yaw_swing(frames_raw: list[np.ndarray], engine, predictor,
+                    lowlight: bool, strength: float) -> float:
+    """Baseline-to-end yaw swing over frames (for live feedback)."""
+    smalls, _ = _prep_frames(frames_raw, lowlight, strength)
+    rgb_smalls = [cv2.cvtColor(s, cv2.COLOR_BGR2RGB) for s in smalls]
+    boxes = [_largest(engine.detect(r)) for r in rgb_smalls]
+    shapes = build_landmark_sets(rgb_smalls, boxes, predictor)
+    yaws = [_yaw_of_shape(sh) for sh in shapes if sh is not None]
+    if len(yaws) < 4:
+        return 0.0
+    baseline = float(np.mean(yaws[:2]))
+    return float(np.mean(yaws[-2:]) - baseline)
+
+
+def quick_blink_count(frames_raw: list[np.ndarray], engine, predictor,
+                      lowlight: bool, strength: float) -> int:
+    """Adaptive blink count over frames (for live feedback)."""
+    smalls, _ = _prep_frames(frames_raw, lowlight, strength)
+    rgb_smalls = [cv2.cvtColor(s, cv2.COLOR_BGR2RGB) for s in smalls]
+    boxes = [_largest(engine.detect(r)) for r in rgb_smalls]
+    shapes = build_landmark_sets(rgb_smalls, boxes, predictor)
+    scores = []
+    uses_68 = False
+    for sm, shape in zip(smalls, shapes):
+        if shape is None:
+            continue
+        if is_68_point(shape):
+            uses_68 = True
+        s = openness_score(shape, cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY))
+        if s is not None:
+            scores.append(s)
+    margin = 0.08 if uses_68 else 0.15
+    blinks, _ = _detect_blinks(scores, margin)
+    return blinks
+
+
 def check_head_turn(ctx: LivenessContext) -> LayerResult:
     yaws = []
     for shape in ctx.landmarks:
@@ -195,19 +293,15 @@ def check_head_turn(ctx: LivenessContext) -> LayerResult:
     peak = max(abs(y - baseline) for y in yaws)
     swing = float(np.mean(yaws[-3:]) - baseline)
 
-    # A rigidly held photo / frozen frame keeps yaw ~ baseline -> fails here.
-    moved = peak > 0.10
+    moved = peak > 0.08
     if not moved:
         return LayerResult("head_turn", False, f"no yaw response (peak {peak:.3f})")
 
     if ctx.prompt_dir in ("left", "right"):
         expected = -1.0 if ctx.prompt_dir == "left" else 1.0
-        matches_dir = swing * expected > 0.06
-        if matches_dir:
-            detail = f"swing={swing:+.3f} peak={peak:.3f} dir={'matched'}"
-        else:
-            detail = f"swing={swing:+.3f} peak={peak:.3f} dir=opposite(accepted)"
-        return LayerResult("head_turn", True, detail)
+        matches_dir = swing * expected > 0.05
+        dir_note = "matched" if matches_dir else "opposite(accepted)"
+        return LayerResult("head_turn", True, f"swing={swing:+.3f} peak={peak:.3f} dir={dir_note}")
     return LayerResult("head_turn", moved, f"swing={swing:+.3f} peak={peak:.3f}")
 
 
@@ -234,38 +328,49 @@ def _fft_scores(g: np.ndarray):
     r2 = (X - cx) ** 2 + (Y - cy) ** 2
     low_e = float(mag[r2 <= 8 ** 2].sum())
     band_e = float(mag[(r2 > 8 ** 2) & (r2 <= 28 ** 2)].sum())
-    high_e = float(mag[r2 > 28 ** 2].sum())
     ratio = band_e / (low_e + 1e-6)
-    # periodicity: strength of strongest off-center spectral peak vs local mean
     outer = mag[(r2 > 6 ** 2)]
     peak = float(outer.max()) if outer.size else 0.0
     periodicity = peak / (float(outer.mean()) + 1e-6)
     lap_var = float(cv2.Laplacian(g, cv2.CV_64F).var())
-    return {"ratio": ratio, "periodicity": periodicity, "lap_var": lap_var, "mean": float(mag.mean())}
+    return {"ratio": ratio, "periodicity": periodicity, "lap_var": lap_var}
 
 
 def check_texture(ctx: LivenessContext) -> LayerResult:
-    # use the largest face of the middle frame
-    mid = len(ctx.frames_enhanced) // 2
-    box = ctx.boxes[mid] if mid < len(ctx.boxes) else None
-    if box is None:
+    """Skin vs print vs screen.
+
+    On a small / dim / low-res webcam patch the "too smooth" cue is
+    unreliable, so it is only trusted for a reasonably large face patch.
+    A strong periodic peak (LCD/OLED raster) is the clearest screen cue.
+    """
+    mid = len(ctx.frames_small) // 2
+    box_small = ctx.boxes[mid] if mid < len(ctx.boxes) else None
+    if box_small is None:
         return LayerResult("texture", False, "no face to analyze")
-    patch = _face_patch_gray(ctx.frames_enhanced[mid], box)
+
+    # Texture runs on the full-res patch for maximum detail. The orchestrator
+    # stores just the enhanced middle frame here.
+    if ctx.full_res_frames:
+        box = _scale_box(box_small, ctx.scale)
+        patch = _face_patch_gray(ctx.full_res_frames[0], box)
+    else:
+        patch = _face_patch_gray(ctx.frames_small[mid], box_small)
     if patch is None:
-        return LayerResult("texture", False, "face too small")
+        return LayerResult("texture", True, "n/a (face too small)")
+
+    pw = patch.shape[1]
     s = _fft_scores(patch)
+    screeny = s["periodicity"] > 3.5
+    smooth_large = s["lap_var"] < 10.0 and pw >= 90
 
-    smooth = s["lap_var"] < 18.0      # printed photo: low micro-texture
-    screeny = s["periodicity"] > 3.2  # LCD/OLED raster: strong periodic peak
-
-    if smooth:
-        return LayerResult("texture", False,
-                           f"too smooth (lap_var={s['lap_var']:.0f} periodic={s['periodicity']:.2f})")
     if screeny:
         return LayerResult("texture", False,
                            f"screen-like periodic texture (periodic={s['periodicity']:.2f})")
+    if smooth_large:
+        return LayerResult("texture", False,
+                           f"too smooth (lap_var={s['lap_var']:.0f} w={pw})")
     return LayerResult("texture", True,
-                       f"lap_var={s['lap_var']:.0f} periodic={s['periodicity']:.2f} band={s['ratio']:.1f}")
+                       f"lap_var={s['lap_var']:.0f} periodic={s['periodicity']:.2f} w={pw}")
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +378,11 @@ def check_texture(ctx: LivenessContext) -> LayerResult:
 # ---------------------------------------------------------------------------
 
 def check_micro_motion(ctx: LivenessContext) -> LayerResult:
-    """Distinguishes a rigidly-held print (uniform flow) or frozen frame
-    from a live face (eyes/lips move independently of the head)."""
-    if len(ctx.frames_enhanced) < 3:
+    if len(ctx.frames_small) < 3:
         return LayerResult("micro_motion", False, "too few frames")
 
-    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in ctx.frames_enhanced]
-    internal_stds, global_means = [], []
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in ctx.frames_small]
+    internal_stds = []
     any_motion = 0.0
     for i in range(1, len(grays)):
         box = ctx.boxes[i - 1] or ctx.boxes[i]
@@ -302,17 +405,14 @@ def check_micro_motion(ctx: LivenessContext) -> LayerResult:
         int_std = float(internal.std())
         glob_mean = float(background.mean()) if background.size else int_mean
         internal_stds.append(int_std / (glob_mean + 1e-3))
-        global_means.append(glob_mean)
         any_motion = max(any_motion, int_mean, glob_mean)
 
     if not internal_stds:
         return LayerResult("micro_motion", False, "no flow computed")
 
     mean_ratio = float(np.mean(internal_stds))
-    # 1) completely frozen frame -> reject (nothing alive)
     if any_motion < 0.05:
         return LayerResult("micro_motion", False, f"no motion detected ({any_motion:.3f})")
-    # 2) rigid uniform motion (photo) -> internal flow mirrors global -> low variance ratio
     if mean_ratio < 0.35 and any_motion > 0.15:
         return LayerResult("micro_motion", False, f"rigid/uniform motion (ratio={mean_ratio:.2f})")
     return LayerResult("micro_motion", True, f"flow ratio={mean_ratio:.2f} motion={any_motion:.2f}")
@@ -323,12 +423,10 @@ def check_micro_motion(ctx: LivenessContext) -> LayerResult:
 # ---------------------------------------------------------------------------
 
 def check_parallax(ctx: LivenessContext, prompt_active: bool) -> LayerResult:
-    """During a head turn, a real face shifts relative to the background
-    (parallax); a rigidly moved print drags the background along with it."""
-    if not prompt_active or len(ctx.frames_enhanced) < 6:
+    if not prompt_active or len(ctx.frames_small) < 6:
         return LayerResult("parallax", True, "n/a (no motion window)")
 
-    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in ctx.frames_enhanced]
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in ctx.frames_small]
     face_pts = []
     bg_pts = []
     bg_prev = None
@@ -368,7 +466,6 @@ def check_parallax(ctx: LivenessContext, prompt_active: bool) -> LayerResult:
     if face_disp < 3.0:
         return LayerResult("parallax", True, "n/a (no face displacement)")
 
-    # Rigid print: background moves along with the print -> similar magnitudes.
     ratio = bg_disp / (face_disp + 1e-6)
     rigid = ratio > 0.85 and bg_disp > 4.0
     if rigid:
@@ -392,26 +489,22 @@ def run_liveness(
     strength: float = 1.0,
 ) -> tuple[bool, list[LayerResult]]:
     """Run all enabled liveness layers. Returns (all_pass, results)."""
-    enhanced = [enhance_single(f, lowlight, strength) for f in frames_raw]
-    rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in enhanced]
+    smalls, scales = _prep_frames(frames_raw, lowlight, strength)
+    rgb_smalls = [cv2.cvtColor(s, cv2.COLOR_BGR2RGB) for s in smalls]
 
-    boxes: list[tuple | None] = []
-    for rgb in rgb_frames:
-        det = engine.detect(rgb)
-        if det:
-            # largest face
-            det.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-            boxes.append(det[0])
-        else:
-            boxes.append(None)
+    boxes: list[tuple | None] = [_largest(engine.detect(r)) for r in rgb_smalls]
 
-    ctx = LivenessContext(frames_enhanced=enhanced, boxes=boxes, prompt_dir=prompt_dir)
-    ctx.landmarks = build_landmark_sets(rgb_frames, boxes, predictor)
+    mid = len(frames_raw) // 2
+    full_mid = enhance_single(frames_raw[mid], lowlight, strength) if frames_raw else None
+
+    ctx = LivenessContext(frames_small=smalls, boxes=boxes, prompt_dir=prompt_dir,
+                          full_res_frames=[full_mid] if full_mid is not None else [],
+                          scale=scales[mid] if scales else 1.0)
+    ctx.landmarks = build_landmark_sets(rgb_smalls, boxes, predictor)
 
     results: list[LayerResult] = []
-
     if layers_cfg.get("blink", True):
-        results.append(check_blink(ctx, predictor))
+        results.append(check_blink(ctx))
     if layers_cfg.get("head_turn", True):
         results.append(check_head_turn(ctx))
     if layers_cfg.get("texture", True):
