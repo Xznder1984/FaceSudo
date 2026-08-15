@@ -38,8 +38,9 @@ class Encryption:
     def __init__(self) -> None:
         raw = keychain.get_encryption_key()
         if raw is None:
-            self._fernet = Fernet(Fernet.generate_key())
-            keychain.set_encryption_key(self._fernet._signing_key + self._fernet._encryption_key)
+            key = Fernet.generate_key()
+            self._fernet = Fernet(key)
+            keychain.set_encryption_key(key)
         else:
             try:
                 self._fernet = Fernet(raw)

@@ -71,6 +71,10 @@ class Config:
     def camera_index(self) -> int:
         return int(self._data.get("camera_index", DEFAULTS["camera_index"]))
 
+    @property
+    def ir_camera(self) -> bool:
+        return bool(self._data.get("ir_camera", DEFAULTS["ir_camera"]))
+
     def liveness_enabled(self, layer: str) -> bool:
         layers = self._data.get("liveness", {})
         return bool(layers.get(layer, DEFAULTS["liveness"].get(layer, True)))

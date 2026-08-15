@@ -7,6 +7,9 @@ is an optional upgrade, not a requirement.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import threading
 import time
 
 import cv2
@@ -19,22 +22,38 @@ class CameraError(RuntimeError):
     pass
 
 
+@contextlib.contextmanager
+def _quiet_cv():
+    """OpenCV prints 'camera failed to initialize' noise to stderr when
+    probing non-existent devices; silence it for those calls."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
 def probe_cameras(max_index: int = 4) -> list[dict]:
     """Return metadata about available capture devices."""
     results = []
     for i in range(max_index):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            ok, frame = cap.read()
-            results.append(
-                {
-                    "index": i,
-                    "ok": ok,
-                    "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if ok else 0,
-                    "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if ok else 0,
-                }
-            )
-        cap.release()
+        with _quiet_cv():
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                ok, frame = cap.read()
+                results.append(
+                    {
+                        "index": i,
+                        "ok": ok,
+                        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if ok else 0,
+                        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if ok else 0,
+                    }
+                )
+            cap.release()
     return results
 
 
@@ -62,8 +81,26 @@ class Camera:
         self.height = height
         self.cap: cv2.VideoCapture | None = None
 
-    def open(self) -> None:
-        cap = cv2.VideoCapture(self.index)
+    def open(self, timeout: float = 8.0) -> None:
+        """Open the camera. Bounded by `timeout` so a busy camera (another app
+        holding the webcam, macOS allows one consumer at a time) never hangs
+        the sudo path -- it raises CameraError instead, which is fail-open."""
+        box: dict = {}
+
+        def _do_open() -> None:
+            with _quiet_cv():
+                cap = cv2.VideoCapture(self.index)
+            box["cap"] = cap
+
+        t = threading.Thread(target=_do_open, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive() or "cap" not in box:
+            raise CameraError(
+                f"camera index {self.index} did not open within {timeout}s "
+                "(is another app using the webcam?)"
+            )
+        cap = box["cap"]
         if not cap.isOpened():
             raise CameraError(f"Could not open camera index {self.index}")
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)

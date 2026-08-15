@@ -137,6 +137,8 @@ def cmd_auth(cfg: Config, args) -> int:
     """The .zshrc wrapper entry. Always ends by either bridging sudo with the
     Keychain password (matched) or exec'ing plain sudo (fallback)."""
     rest = args.sudo_args
+    if rest and rest[0] == "--":
+        rest = rest[1:]  # tolerate `facesudo-auth -- <args>`
 
     if not cfg.enabled:
         return exec_sudo_plain(rest)

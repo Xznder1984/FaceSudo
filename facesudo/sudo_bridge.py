@@ -17,6 +17,7 @@ import signal
 import struct
 import sys
 import termios
+import time
 import tty
 
 SUDO_BIN = "/usr/bin/sudo"
@@ -45,8 +46,8 @@ def bridge_sudo(args: list[str], password: str) -> int:
     _sync_winsize(master)
 
     saved = None
+    fd_in = sys.stdin.fileno()
     try:
-        fd_in = sys.stdin.fileno()
         if os.isatty(fd_in):
             saved = termios.tcgetattr(fd_in)
             tty.setcbreak(fd_in)
@@ -59,12 +60,17 @@ def bridge_sudo(args: list[str], password: str) -> int:
     old_winch = signal.signal(signal.SIGWINCH, _on_winch)
 
     answered = False
+    stdin_open = True
     status = 1
     try:
         buf = b""
+        stdin_deadline = None
         while True:
+            sources = [master]
+            if stdin_open:
+                sources.append(fd_in)
             try:
-                r, _, _ = select.select([master, fd_in], [], [], 0.1)
+                r, _, _ = select.select(sources, [], [], 0.2)
             except (OSError, ValueError):
                 break
 
@@ -87,17 +93,31 @@ def bridge_sudo(args: list[str], password: str) -> int:
                         pass
                     buf = b""
 
-            if fd_in in r:
+            if stdin_open and fd_in in r:
                 try:
                     data = os.read(fd_in, 4096)
                 except OSError:
                     data = b""
                 if not data:
-                    break
+                    # stdin closed (e.g. piped). Stop reading it, keep
+                    # forwarding the pty so sudo still completes.
+                    stdin_open = False
+                    if not answered:
+                        stdin_deadline = time.monotonic() + 12.0
+                else:
+                    try:
+                        os.write(master, data)
+                    except OSError:
+                        pass
+
+            # If stdin is gone and sudo is still waiting on a prompt we never
+            # answered, give it a short grace then terminate rather than hang.
+            if stdin_deadline is not None and time.monotonic() > stdin_deadline:
                 try:
-                    os.write(master, data)
-                except OSError:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
                     pass
+                break
 
         _, status = os.waitpid(pid, 0)
     finally:

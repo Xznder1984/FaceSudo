@@ -21,10 +21,7 @@ import cv2
 import dlib
 import numpy as np
 
-from .config import MODELS_DIR
 from .preprocessing import enhance_single
-
-_68POINT_PATH = MODELS_DIR / "shape_predictor_68_face_landmarks.dat"
 
 # 5-point model indices (bundled with face_recognition)
 P_LEFT_EYE = 0
@@ -33,8 +30,20 @@ P_NOSE = 2
 P_MOUTH_LEFT = 3
 P_MOUTH_RIGHT = 4
 
+# 68-point model indices (bundled with face_recognition as
+# shape_predictor_68_face_landmarks.dat, returned by pose_predictor_model_location)
+E68_LEFT_EYE = 36   # left eye outer corner
+E68_RIGHT_EYE = 45  # right eye outer corner
+E68_NOSE_TIP = 30
 _EYE68_LEFT = list(range(36, 42))
 _EYE68_RIGHT = list(range(42, 48))
+
+
+def is_68_point(shape) -> bool:
+    try:
+        return shape.num_parts == 68
+    except Exception:
+        return False
 
 
 @dataclass
@@ -115,12 +124,12 @@ def _ear_68(shape) -> float:
     return (ear(_EYE68_LEFT) + ear(_EYE68_RIGHT)) / 2.0
 
 
-def check_blink(ctx: LivenessContext, predictor, use_68: bool) -> LayerResult:
+def check_blink(ctx: LivenessContext, predictor) -> LayerResult:
     scores = []
     for i, (frame, shape) in enumerate(zip(ctx.frames_enhanced, ctx.landmarks)):
         if shape is None:
             continue
-        if use_68:
+        if is_68_point(shape):
             scores.append(_ear_68(shape))
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -130,9 +139,11 @@ def check_blink(ctx: LivenessContext, predictor, use_68: bool) -> LayerResult:
     if len(scores) < 4:
         return LayerResult("blink", False, f"insufficient frames tracked ({len(scores)})")
 
-    if use_68:
-        lo, hi = 0.22, 0.26
-        low, high = lo, hi
+    # EAR-style scores (68-point) are lower-magnitude than the 5-point
+    # openness score; pick thresholds from the dominant model.
+    uses_68 = sum(1 for s in ctx.landmarks if s is not None and is_68_point(s))
+    if uses_68 >= len(scores) // 2:
+        low, high = 0.22, 0.26
     else:
         low, high = 0.30, 0.48
 
@@ -158,8 +169,16 @@ def check_blink(ctx: LivenessContext, predictor, use_68: bool) -> LayerResult:
 # Head turn detection
 # ---------------------------------------------------------------------------
 
-def _yaw(shape) -> float:
-    nose, le, re = shape.part(P_NOSE), shape.part(P_LEFT_EYE), shape.part(P_RIGHT_EYE)
+def _yaw_of_shape(shape) -> float:
+    """View-relative yaw proxy: positive nose-to-left-eye / right-eye ratio
+    means the head is turned to the subject's right. Works for both the
+    5-point and 68-point landmark models."""
+    if is_68_point(shape):
+        nose, le, re = (shape.part(E68_NOSE_TIP), shape.part(E68_LEFT_EYE),
+                        shape.part(E68_RIGHT_EYE))
+    else:
+        nose, le, re = (shape.part(P_NOSE), shape.part(P_LEFT_EYE),
+                        shape.part(P_RIGHT_EYE))
     dl, dr = _dist(nose, le), _dist(nose, re)
     return (dl - dr) / (dl + dr + 1e-6)
 
@@ -168,7 +187,7 @@ def check_head_turn(ctx: LivenessContext) -> LayerResult:
     yaws = []
     for shape in ctx.landmarks:
         if shape is not None:
-            yaws.append(_yaw(shape))
+            yaws.append(_yaw_of_shape(shape))
     if len(yaws) < 6:
         return LayerResult("head_turn", False, f"insufficient frames ({len(yaws)})")
 
@@ -386,14 +405,13 @@ def run_liveness(
         else:
             boxes.append(None)
 
-    use_68 = _68POINT_PATH.exists()
     ctx = LivenessContext(frames_enhanced=enhanced, boxes=boxes, prompt_dir=prompt_dir)
     ctx.landmarks = build_landmark_sets(rgb_frames, boxes, predictor)
 
     results: list[LayerResult] = []
 
     if layers_cfg.get("blink", True):
-        results.append(check_blink(ctx, predictor, use_68))
+        results.append(check_blink(ctx, predictor))
     if layers_cfg.get("head_turn", True):
         results.append(check_head_turn(ctx))
     if layers_cfg.get("texture", True):

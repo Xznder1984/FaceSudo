@@ -333,11 +333,9 @@ class EnrollmentWindow(QDialog):
             shape = self.predictor(rgb, rect)
         except Exception:
             return None
-        from .liveness import _dist, P_LEFT_EYE, P_NOSE, P_RIGHT_EYE
+        from .liveness import _yaw_of_shape
 
-        nose, le, re = shape.part(P_NOSE), shape.part(P_LEFT_EYE), shape.part(P_RIGHT_EYE)
-        dl, dr = _dist(nose, le), _dist(nose, re)
-        return (dl - dr) / (dl + dr + 1e-6)
+        return _yaw_of_shape(shape)
 
     def _tick(self) -> None:
         if self.camera is None:

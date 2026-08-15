@@ -32,6 +32,9 @@ echo "[2/4] Installing dependencies (dlib compiles from source; may take several
 "$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt"
 
 # 2. Models ---------------------------------------------------------------
+# The dlib ResNet-50 embedding, 5-point and 68-point landmark models ship
+# inside the face_recognition_models package. Only YuNet (better low-light
+# detection) is fetched separately.
 mkdir -p "$MODELS_DIR"
 YUNET="$MODELS_DIR/face_detection_yunet_2023mar.onnx"
 if [ ! -f "$YUNET" ]; then
@@ -41,15 +44,6 @@ if [ ! -f "$YUNET" ]; then
         || { echo "      (download failed - will use dlib HOG detector)"; rm -f "$YUNET"; }
 else
     echo "[2/4] YuNet model already present."
-fi
-
-P68="$MODELS_DIR/shape_predictor_68_face_landmarks.dat"
-if [ "${1:-}" = "--download-68" ] && [ ! -f "$P68" ]; then
-    echo "[2/4] Downloading 68-point landmark model (~96 MB) for stronger blink detection..."
-    curl -L --fail -sS -o "$P68.bz2" \
-        "https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2" \
-        && bzip2 -d "$P68.bz2" \
-        || { echo "      (download failed - will use the 5-point eye-openness blink check)"; rm -f "$P68.bz2" "$P68"; }
 fi
 
 # 3. Launcher scripts -----------------------------------------------------
