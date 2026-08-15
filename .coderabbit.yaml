@@ -1,0 +1,41 @@
+# CodeRabbit configuration for FaceSudo
+language: en-US
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  changed_files_summary: true
+  path_filters:
+    - "!**/*.lock"
+    - "!**/models/**"
+    - "!**/.facesudo/**"
+  path_instructions:
+    - path: "facesudo/**"
+      instructions: |
+        This is security-sensitive Python for a local face-recognition sudo
+        authenticator. Review for:
+        - Password handling: the sudo password must only ever be read from the
+          macOS Keychain (via facesudo/keychain.py) inside the verified-match
+          code path. It must never be written to disk, logged, or appear in
+          argv or shell history. The GUI password field must be cleared after
+          the Keychain write.
+        - Fail-open behavior: every failure path must fall back to the normal
+          password prompt. Never fail closed / never deny.
+        - No secrets in config or SQLite (encodings must stay Fernet-encrypted,
+          key in Keychain).
+        - SQL injection and parameterized queries in facesudo/storage.py and
+          facesudo/log.py.
+        - Race conditions / deadlocks in the pty bridge (facesudo/sudo_bridge.py).
+        - Crashes that could break an interactive sudo call.
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto

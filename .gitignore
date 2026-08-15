@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Local config/runtime (never commit Keychain data, encodings, or logs)
+.facesudo/
+
+# Editors
+.vscode/
+.idea/
