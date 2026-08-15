@@ -13,6 +13,7 @@ per-phase feedback (blink detected, head-turn swing) as they happen.
 from __future__ import annotations
 
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -79,10 +80,10 @@ class CliSession(MatchSession):
         if self.ui is not None:
             self.ui.show(message)
         else:
-            print(f"FaceSudo: {message}", flush=True)
+            print(f"FaceSudo: {message}", file=sys.stderr, flush=True)
 
     def feedback(self, message: str) -> None:
-        print(f"  -> {message}", flush=True)
+        print(f"  -> {message}", file=sys.stderr, flush=True)
 
 
 class CancelFlag:
@@ -236,8 +237,8 @@ def run_match_with_session(
                 result.reason = "no frames from camera"
                 return result
             for frame in burst:
-                _, box, _, _ = _annotate(frame, engine, predictor, lowlight, strength)
-                session.preview(frame, box)
+                sm, box, _, _ = _annotate(frame, engine, predictor, lowlight, strength)
+                session.preview(sm, box)
                 if box is not None:
                     face_box = box
                     break
@@ -255,7 +256,7 @@ def run_match_with_session(
         def _on_a(frame):
             nonlocal counter
             sm, box, _, shape = _annotate(frame, engine, predictor, lowlight, strength)
-            session.preview(frame, box)
+            session.preview(sm, box)
             if shape is None:
                 return
             if counter is None:
@@ -286,7 +287,7 @@ def run_match_with_session(
         def _on_b(frame):
             nonlocal swing_seen
             sm, box, yaw, _ = _annotate(frame, engine, predictor, lowlight, strength)
-            session.preview(frame, box, yaw)
+            session.preview(sm, box, yaw)
             if yaw is not None:
                 yaws.append(yaw)
                 if len(yaws) >= 4 and not swing_seen:

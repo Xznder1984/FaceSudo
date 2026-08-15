@@ -410,10 +410,15 @@ def check_micro_motion(ctx: LivenessContext) -> LayerResult:
     if not internal_stds:
         return LayerResult("micro_motion", False, "no flow computed")
 
+    # Flow magnitudes are measured on the downscaled frames; scale the
+    # thresholds so they behave like the original full-resolution values.
+    scale = ctx.scale or 1.0
+    no_motion = 0.05 * scale
+    rigid_motion = 0.15 * scale
     mean_ratio = float(np.mean(internal_stds))
-    if any_motion < 0.05:
+    if any_motion < no_motion:
         return LayerResult("micro_motion", False, f"no motion detected ({any_motion:.3f})")
-    if mean_ratio < 0.35 and any_motion > 0.15:
+    if mean_ratio < 0.35 and any_motion > rigid_motion:
         return LayerResult("micro_motion", False, f"rigid/uniform motion (ratio={mean_ratio:.2f})")
     return LayerResult("micro_motion", True, f"flow ratio={mean_ratio:.2f} motion={any_motion:.2f}")
 
@@ -463,11 +468,14 @@ def check_parallax(ctx: LivenessContext, prompt_active: bool) -> LayerResult:
 
     face_disp = float(np.linalg.norm(np.asarray(face_pts[-1]) - np.asarray(face_pts[0])))
     bg_disp = float(np.mean(bg_pts))
-    if face_disp < 3.0:
+    # Displacements are measured on the downscaled frames; scale thresholds
+    # to behave like the original full-resolution values.
+    scale = ctx.scale or 1.0
+    if face_disp < 3.0 * scale:
         return LayerResult("parallax", True, "n/a (no face displacement)")
 
     ratio = bg_disp / (face_disp + 1e-6)
-    rigid = ratio > 0.85 and bg_disp > 4.0
+    rigid = ratio > 0.85 and bg_disp > 4.0 * scale
     if rigid:
         return LayerResult("parallax", False,
                            f"rigid motion bg={bg_disp:.1f} face={face_disp:.1f} ratio={ratio:.2f}")

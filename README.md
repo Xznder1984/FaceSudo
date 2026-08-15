@@ -117,9 +117,11 @@ live camera window that walks you through each step in real time:
 4. **Matching** — per-layer PASS/FAIL shown, then the result.
 
 The same flow runs in the terminal when `match_gui` is off or Qt is
-unavailable. Liveness analysis always runs on a downscaled 320 px pipeline so
-the whole attempt stays fast even on a low-power Intel CPU; texture analysis
-still uses the full-resolution frame.
+unavailable; the sudo path falls back to the normal password prompt if the
+window is cancelled, and `facesudo verify --gui` falls back to terminal
+matching if Qt can't start. Liveness analysis always runs on a downscaled
+320 px pipeline so the whole attempt stays fast even on a low-power Intel
+CPU; texture analysis still uses the full-resolution frame.
 
 ## Requirements
 

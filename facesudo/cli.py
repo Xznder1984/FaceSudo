@@ -168,18 +168,20 @@ def cmd_auth(cfg: Config, args) -> int:
         return exec_sudo_plain(rest)
 
     result = None
+    used_gui = False
     if cfg.match_gui:
         try:
             from .gui import run_match_dialog
 
             result = run_match_dialog(cfg)
+            used_gui = True
         except Exception as e:
             print(f"[FaceSudo] guided window unavailable ({e}); using terminal flow.",
                   file=sys.stderr)
-        if result is None:
+        if used_gui and result is None:
             print("[FaceSudo] match cancelled; password prompt.", file=sys.stderr)
             return exec_sudo_plain(rest)
-    else:
+    if result is None:
         engine, predictor = _build()
         store = EncodingStore()
         result = run_match(cfg, store, engine, predictor)

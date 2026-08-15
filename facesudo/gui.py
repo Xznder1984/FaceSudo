@@ -556,7 +556,13 @@ class MatchWindow(QDialog):
     def closeEvent(self, event) -> None:
         self._cancel.cancel()
         if self.worker is not None and self.worker.isRunning():
-            self.worker.wait(5000)
+            if not self.worker.wait(5000):
+                # Never destroy the dialog while the worker thread still runs.
+                event.ignore()
+                self.step.setText("Stopping camera...")
+                self.cancel_btn.setEnabled(False)
+                self.worker.finished.connect(self.close)
+                return
         super().closeEvent(event)
 
 
