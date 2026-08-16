@@ -28,7 +28,7 @@ import cv2
 import dlib
 import numpy as np
 
-from .preprocessing import enhance_single
+from .preprocessing import enhance_quick
 
 LIVENESS_WIDTH = 320
 
@@ -103,11 +103,17 @@ def _largest(boxes):
 
 def _prep_frames(frames_raw: list[np.ndarray], lowlight: bool, strength: float):
     """Downscale + enhance each frame to LIVENESS_WIDTH once. Returns
-    (smalls_bgr, scales). Detection/landmarks/flow run on these smalls."""
+    (smalls_bgr, scales). Detection/landmarks/flow run on these smalls.
+
+    Uses the CLAHE-only pass: fastNLM denoise costs ~1.3 s/frame on a
+    low-power Intel CPU and multi-frame liveness analysis doesn't need it.
+    The recognition embedding still uses the full pipeline on the averaged
+    frame (see preprocessing.enhance), keeping enrollment/match consistent.
+    """
     smalls, scales = [], []
     for f in frames_raw:
         sm, sc = _to_width(f, LIVENESS_WIDTH)
-        smalls.append(enhance_single(sm, lowlight, strength))
+        smalls.append(enhance_quick(sm, lowlight, strength))
         scales.append(sc)
     return smalls, scales
 
@@ -173,16 +179,52 @@ def openness_score(shape, gray) -> float | None:
     return _eye_openness_5pt(gray, shape, None)
 
 
-def _detect_blinks(scores: list[float], margin: float) -> tuple[int, float]:
-    """Adaptive open->closed->open cycle count around the median baseline."""
-    if not scores:
+def _detect_blinks(records: list[tuple[bool, float | None]], ratio: float,
+                   margin: float) -> tuple[int, float]:
+    """Adaptive open->closed->open cycle count.
+
+    `records` is a per-frame list of (present, score) pairs, where `present`
+    is whether landmarks were found. On a dim webcam the landmark detector
+    routinely drops frames *during* a blink (closed eyes), so a blink is
+    counted either by:
+      - an EAR/openness dip below a relative baseline and recovery, or
+      - a transient detection gap (face lost for <=3 frames, then recovered),
+        which is exactly what a blink looks like to the detector.
+
+    The closed threshold is relative to the running-median baseline so it
+    still bites when the baseline is low (dim light, low-res landmarks):
+    `closed = max(baseline - margin, baseline * ratio)`.
+    """
+    if not records:
         return 0, 0.0
-    baseline = float(np.median(scores))
-    closed = baseline - margin
-    reopen = baseline - margin * 0.4
+    if not any(p for p, _ in records):
+        return 0, 0.0
+    valid = [s for p, s in records if p and s is not None]
+    baseline = float(np.median(valid)) if valid else 0.0
+    closed = max(baseline - margin, baseline * ratio)
+    reopen = closed + (baseline - closed) * 0.5
+
     blinks = 0
     state = "init"
-    for s in scores:
+    i = 0
+    n = len(records)
+    while i < n:
+        present, s = records[i]
+        if not present:
+            j = i
+            while j < n and not records[j][0]:
+                j += 1
+            gap_len = j - i
+            if state in ("open", "closed") and gap_len <= 3 and j < n and records[j][0]:
+                blinks += 1
+                state = "open"
+            elif gap_len > 3:
+                state = "init"  # face left the frame; reset
+            i = j
+            continue
+        if s is None:
+            i += 1
+            continue
         if state == "init":
             if s >= closed:
                 state = "open"
@@ -193,30 +235,34 @@ def _detect_blinks(scores: list[float], margin: float) -> tuple[int, float]:
             if s >= reopen:
                 blinks += 1
                 state = "open"
+        i += 1
     return blinks, baseline
 
 
 def check_blink(ctx: LivenessContext) -> LayerResult:
-    scores = []
+    records: list[tuple[bool, float | None]] = []
     uses_68 = False
     for i, (small, shape) in enumerate(zip(ctx.frames_small, ctx.landmarks)):
         if shape is None:
+            records.append((False, None))
             continue
         if is_68_point(shape):
             uses_68 = True
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         s = openness_score(shape, gray)
-        if s is not None:
-            scores.append(s)
-    if len(scores) < 4:
-        return LayerResult("blink", False, f"insufficient frames tracked ({len(scores)})")
+        records.append((True, s))
+    if len(records) < 4:
+        return LayerResult("blink", False, f"insufficient frames tracked ({len(records)})")
 
     margin = 0.08 if uses_68 else 0.15
-    blinks, baseline = _detect_blinks(scores, margin)
+    ratio = 0.65 if uses_68 else 0.75
+    blinks, baseline = _detect_blinks(records, ratio, margin)
     ok = blinks >= 1
-    spread = max(scores) - min(scores)
+    present = sum(1 for p, _ in records if p)
+    valid = [s for p, s in records if p and s is not None]
+    spread = (max(valid) - min(valid)) if len(valid) >= 2 else 0.0
     detail = (f"blinks={blinks} baseline={baseline:.2f} spread={spread:.2f} "
-              f"min={min(scores):.2f} max={max(scores):.2f}")
+              f"tracked={present}/{len(records)}")
     return LayerResult("blink", ok, detail)
 
 
@@ -266,18 +312,19 @@ def quick_blink_count(frames_raw: list[np.ndarray], engine, predictor,
     rgb_smalls = [cv2.cvtColor(s, cv2.COLOR_BGR2RGB) for s in smalls]
     boxes = [_largest(engine.detect(r)) for r in rgb_smalls]
     shapes = build_landmark_sets(rgb_smalls, boxes, predictor)
-    scores = []
+    records: list[tuple[bool, float | None]] = []
     uses_68 = False
     for sm, shape in zip(smalls, shapes):
         if shape is None:
+            records.append((False, None))
             continue
         if is_68_point(shape):
             uses_68 = True
         s = openness_score(shape, cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY))
-        if s is not None:
-            scores.append(s)
+        records.append((True, s))
     margin = 0.08 if uses_68 else 0.15
-    blinks, _ = _detect_blinks(scores, margin)
+    ratio = 0.65 if uses_68 else 0.75
+    blinks, _ = _detect_blinks(records, ratio, margin)
     return blinks
 
 
@@ -293,7 +340,7 @@ def check_head_turn(ctx: LivenessContext) -> LayerResult:
     peak = max(abs(y - baseline) for y in yaws)
     swing = float(np.mean(yaws[-3:]) - baseline)
 
-    moved = peak > 0.08
+    moved = peak > 0.055
     if not moved:
         return LayerResult("head_turn", False, f"no yaw response (peak {peak:.3f})")
 
@@ -503,7 +550,7 @@ def run_liveness(
     boxes: list[tuple | None] = [_largest(engine.detect(r)) for r in rgb_smalls]
 
     mid = len(frames_raw) // 2
-    full_mid = enhance_single(frames_raw[mid], lowlight, strength) if frames_raw else None
+    full_mid = enhance_quick(frames_raw[mid], lowlight, strength) if frames_raw else None
 
     ctx = LivenessContext(frames_small=smalls, boxes=boxes, prompt_dir=prompt_dir,
                           full_res_frames=[full_mid] if full_mid is not None else [],

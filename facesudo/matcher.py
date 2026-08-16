@@ -139,24 +139,43 @@ def _shape_of(rgb, box, predictor):
 
 
 class _LiveBlinkCounter:
-    """Streaming open->closed->open counter around a running median baseline."""
+    """Streaming blink counter: EAR-dip around a running median baseline OR a
+    transient landmark-detection gap (the landmark detector drops frames
+    during a blink on dim webcams)."""
 
-    def __init__(self, margin: float) -> None:
+    def __init__(self, ratio: float, margin: float) -> None:
+        self.ratio = ratio
         self.margin = margin
-        self.scores: list[float] = []
+        self.records: list[tuple[bool, float | None]] = []
         self.state = "init"
         self.count = 0
+        self._gap_start: int | None = None
 
-    def feed(self, score) -> int | None:
+    def feed(self, present: bool, score) -> int | None:
+        self.records.append((present, score))
+        if not present:
+            if self._gap_start is None:
+                self._gap_start = len(self.records) - 1
+            elif len(self.records) - 1 - self._gap_start > 3:
+                self.state = "init"  # face left; reset
+            return None
+
+        if self._gap_start is not None:
+            gap = len(self.records) - 1 - self._gap_start
+            self._gap_start = None
+            if gap <= 3 and self.state in ("open", "closed"):
+                self.count += 1
+                self.state = "open"
+                return self.count
         if score is None:
             return None
-        self.scores.append(float(score))
-        if len(self.scores) < 3:
+        valid = [s for p, s in self.records if p and s is not None]
+        if len(valid) < 3:
             return None
-        baseline = float(np.median(self.scores))
-        closed = baseline - self.margin
-        reopen = baseline - self.margin * 0.4
-        s = self.scores[-1]
+        baseline = float(np.median(valid))
+        closed = max(baseline - self.margin, baseline * self.ratio)
+        reopen = closed + (baseline - closed) * 0.5
+        s = score
         if self.state == "init":
             if s >= closed:
                 self.state = "open"
@@ -176,7 +195,8 @@ class _LiveBlinkCounter:
 
 
 def _capture_burst(cam, n: int, delay: float = 0.03,
-                   deadline: float | None = None, on_frame=None) -> list:
+                   deadline: float | None = None, on_frame=None, stop=None,
+                   stop_min: int = 0) -> list:
     frames = []
     for _ in range(n):
         if deadline is not None and time.monotonic() > deadline:
@@ -187,6 +207,8 @@ def _capture_burst(cam, n: int, delay: float = 0.03,
         frames.append(frame)
         if on_frame is not None:
             on_frame(frame)
+        if stop is not None and stop() and len(frames) >= stop_min:
+            break
         if delay > 0:
             time.sleep(delay)
     return frames
@@ -260,15 +282,21 @@ def run_match_with_session(
             if shape is None:
                 return
             if counter is None:
-                counter = _LiveBlinkCounter(0.08 if is_68_point(shape) else 0.15)
+                counter = _LiveBlinkCounter(0.65 if is_68_point(shape) else 0.75,
+                                            0.08 if is_68_point(shape) else 0.15)
+            present = shape is not None
             gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
-            new = counter.feed(openness_score(shape, gray))
+            score = openness_score(shape, gray) if present else None
+            new = counter.feed(present, score)
             if new:
                 session.feedback(f"blink {new} detected")
 
-        frames_a = _capture_burst(cam, 8, delay=0.03,
-                                  deadline=_phase_deadline(8, 0.03),
-                                  on_frame=_on_a)
+        def _stop_a():
+            return counter is not None and counter.total >= 2
+
+        frames_a = _capture_burst(cam, 14, delay=0.03,
+                                  deadline=_phase_deadline(14, 0.03),
+                                  on_frame=_on_a, stop=_stop_a, stop_min=8)
         if session.cancelled():
             result.reason = "cancelled by user"
             return result
@@ -299,9 +327,12 @@ def run_match_with_session(
                         note = "good" if swing * expected > 0.0 else "opposite (fine)"
                         session.feedback(f"{note} - hold the turn")
 
-        frames_b = _capture_burst(cam, 8, delay=0.04,
-                                  deadline=_phase_deadline(8, 0.04),
-                                  on_frame=_on_b)
+        def _stop_b():
+            return len(yaws) >= 4 and abs(float(np.mean(yaws[-2:]) - np.mean(yaws[:2]))) > 0.10
+
+        frames_b = _capture_burst(cam, 26, delay=0.06,
+                                  deadline=_phase_deadline(26, 0.06),
+                                  on_frame=_on_b, stop=_stop_b, stop_min=6)
         if session.cancelled():
             result.reason = "cancelled by user"
             return result
@@ -311,24 +342,35 @@ def run_match_with_session(
         swing = float(np.mean(yaws[-2:]) - np.mean(yaws[:2])) if len(yaws) >= 4 else 0.0
         session.feedback(f"head turn {turn_dir}: swing {swing:+.2f}")
 
-        frames = frames_a + frames_b
+        # --- Recognition on the multi-frame average. Only the blink-window
+        # frames are used: the user faces the camera throughout phase A,
+        # whereas phase B frames include the (intentionally) turned face. ---
+        frames = frames_a
         if len(frames) < 6:
             result.reason = "camera dropped too many frames"
             return result
 
-        # --- Full liveness stack over all captured frames ---
-        liveness_ok, liveness_results = run_liveness(
-            {
-                k: config.liveness_enabled(k)
-                for k in ("blink", "head_turn", "texture", "micro_motion", "parallax")
-            },
-            frames,
-            engine,
-            predictor,
-            prompt_dir=turn_dir,
-            lowlight=lowlight,
-            strength=strength,
-        )
+        # --- Full liveness stack. Blink/texture/micro_motion run on the
+        # blink window (frames_a); head_turn/parallax on the turn window
+        # (frames_b). Splitting keeps the head-turn frames from skewing the
+        # adaptive blink baseline. Each call passes explicit on/off for every
+        # layer so run_liveness never enables a layer by default.
+        ALL_LAYERS = ("blink", "head_turn", "texture", "micro_motion", "parallax")
+        layer_cfg = {k: config.liveness_enabled(k) for k in ALL_LAYERS}
+
+        def _subset(active: set[str]) -> dict:
+            return {k: (layer_cfg[k] if k in active else False) for k in ALL_LAYERS}
+
+        ok_a, res_a = run_liveness(
+            _subset({"blink", "texture", "micro_motion"}),
+            frames_a, engine, predictor, prompt_dir="",
+            lowlight=lowlight, strength=strength)
+        ok_b, res_b = run_liveness(
+            _subset({"head_turn", "parallax"}),
+            frames_b, engine, predictor, prompt_dir=turn_dir,
+            lowlight=lowlight, strength=strength)
+        liveness_results = res_a + res_b
+        liveness_ok = ok_a and ok_b
         result.liveness = liveness_results
         for lr in liveness_results:
             mark = "PASS" if lr.passed else "FAIL"

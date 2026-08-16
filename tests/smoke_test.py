@@ -31,6 +31,8 @@ def main() -> int:
         return 1
     print(f"image: {bgr.shape[1]}x{bgr.shape[0]}")
 
+    # Detect/encode on the enhanced frame, mirroring the production pipeline.
+    bgr = preprocessing.enhance([bgr, bgr, bgr, bgr], True, 1.0)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     # --- detection ---

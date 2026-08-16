@@ -351,7 +351,7 @@ class EnrollmentWindow(QDialog):
             return
         from . import preprocessing
 
-        enhanced = preprocessing.enhance_single(
+        enhanced = preprocessing.enhance_quick(
             frame, self.cfg.lowlight, self.cfg.lowlight_strength)
         rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
         box = None
@@ -436,9 +436,11 @@ class _GuiSession(MatchSession):
         self.cancel_flag = cancel_flag
 
     def prompt(self, message: str) -> None:
+        print(f"[FaceSudo] {message}", file=sys.stderr)
         self.worker.prompt_signal.emit(message)
 
     def feedback(self, message: str) -> None:
+        print(f"[FaceSudo] {message}", file=sys.stderr)
         self.worker.feedback_signal.emit(message)
 
     def preview(self, frame_bgr, box=None, yaw=None) -> None:
@@ -490,12 +492,12 @@ class MatchWindow(QDialog):
 
         layout = QVBoxLayout(self)
 
-        self.preview = QLabel("starting camera...")
+        self.preview = QLabel("camera starts after you click Start")
         self.preview.setMinimumSize(480, 320)
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.preview, 1)
 
-        self.step = QLabel("")
+        self.step = QLabel("Face the camera, then click Start.")
         self.step.setWordWrap(True)
         self.step.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(self.step)
@@ -504,11 +506,19 @@ class MatchWindow(QDialog):
         self.feedback.setWordWrap(True)
         layout.addWidget(self.feedback)
 
+        self.start_btn = QPushButton("Start match")
+        self.start_btn.clicked.connect(self._begin)
+        self.start_btn.setDefault(True)
+        layout.addWidget(self.start_btn)
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self._on_cancel)
+        self.cancel_btn.setEnabled(False)
         layout.addWidget(self.cancel_btn)
 
-    def start(self) -> None:
+    def _begin(self) -> None:
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
         self.worker = _MatchWorker(self.cfg, self._cancel, self)
         self.worker.preview_signal.connect(self._on_preview)
         self.worker.prompt_signal.connect(self._on_prompt)
@@ -575,7 +585,6 @@ def run_match_dialog(cfg: Config):
     if app is None:
         app = QApplication(sys.argv)
     win = MatchWindow(cfg)
-    win.start()
     win.exec()
     return win.result
 
