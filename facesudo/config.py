@@ -19,7 +19,7 @@ MODELS_DIR = CONFIG_DIR / "models"
 DEFAULTS = {
     "enabled": True,
     "threshold": 0.55,          # face_distance threshold; lower = stricter
-    "timeout": 10,              # seconds allowed for a match attempt
+    "timeout": 20,              # seconds allowed for the face-hunt before password fallback
     "lowlight": True,           # run the low-light enhancement pipeline
     "lowlight_strength": 1.0,   # 0.0 - 2.0 multiplier for CLAHE/denoise params
     "camera_index": 0,

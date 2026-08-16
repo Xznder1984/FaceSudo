@@ -69,6 +69,7 @@ class LivenessContext:
     prompt_dir: str = ""  # "left" | "right" | ""
     landmarks: list = field(default_factory=list)  # per frame shape or None
     full_res_frames: list[np.ndarray] = field(default_factory=list)  # for texture
+    full_shapes: list = field(default_factory=list)  # 68-pt shapes on full-res frames (blink)
     scale: float = 1.0
 
 
@@ -134,6 +135,30 @@ def build_landmark_sets(frames_rgb, boxes, predictor):
     return shapes
 
 
+def build_full_shapes(frames_raw, boxes_small, smalls, predictor):
+    """68-pt shapes computed on the full-res frames (for blink analysis).
+
+    The downscaled landmarks are too coarse to resolve eyelid closure on a
+    dim/low-res webcam (the predictor returns a near-fixed eye template), so
+    blink uses shapes predicted on the full-resolution frame. Detection still
+    runs on the cheap downscaled frames; only the box is mapped back."""
+    shapes = []
+    for frame, sm, box in zip(frames_raw, smalls, boxes_small):
+        if box is None:
+            shapes.append(None)
+            continue
+        sx = frame.shape[1] / sm.shape[1]
+        sy = frame.shape[0] / sm.shape[0]
+        top, right, bottom, left = box
+        rect = dlib.rectangle(int(left * sx), int(top * sy),
+                              int(right * sx), int(bottom * sy))
+        try:
+            shapes.append(predictor(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), rect))
+        except Exception:
+            shapes.append(None)
+    return shapes
+
+
 # ---------------------------------------------------------------------------
 # Blink detection (adaptive)
 # ---------------------------------------------------------------------------
@@ -191,16 +216,25 @@ def _detect_blinks(records: list[tuple[bool, float | None]], ratio: float,
       - a transient detection gap (face lost for <=3 frames, then recovered),
         which is exactly what a blink looks like to the detector.
 
-    The closed threshold is relative to the running-median baseline so it
-    still bites when the baseline is low (dim light, low-res landmarks):
-    `closed = max(baseline - margin, baseline * ratio)`.
+    The baseline is the median of the *upper half* of scores, i.e. the
+    typical open-eye state; blinking frames drag the all-scores median down,
+    which would make the closed threshold chase the blink itself. The closed
+    threshold stays relative so it bites even when the signal is compressed
+    (dim light, low-res landmarks): `closed = max(baseline - margin,
+    baseline * ratio)`.
+
+    As a last resort, if no clean dip cycle was found but the eye openness
+    swung widely within the phase, count one blink anyway: at 320 px a real
+    blink is often visible as large EAR variation without a clean threshold
+    crossing.
     """
     if not records:
         return 0, 0.0
-    if not any(p for p, _ in records):
-        return 0, 0.0
     valid = [s for p, s in records if p and s is not None]
-    baseline = float(np.median(valid)) if valid else 0.0
+    if not valid:
+        return 0, 0.0
+    hi = sorted(valid)
+    baseline = float(np.median(hi[len(hi) // 2:]))
     closed = max(baseline - margin, baseline * ratio)
     reopen = closed + (baseline - closed) * 0.5
 
@@ -236,13 +270,21 @@ def _detect_blinks(records: list[tuple[bool, float | None]], ratio: float,
                 blinks += 1
                 state = "open"
         i += 1
+
+    if blinks == 0 and len(valid) >= 3:
+        lo, hi_v = min(valid), max(valid)
+        if hi_v - lo > 0.15 and hi_v > 1.8 * lo and lo > 0.02:
+            blinks = 1
     return blinks, baseline
 
 
 def check_blink(ctx: LivenessContext) -> LayerResult:
     records: list[tuple[bool, float | None]] = []
     uses_68 = False
-    for i, (small, shape) in enumerate(zip(ctx.frames_small, ctx.landmarks)):
+    # Prefer full-res 68-pt shapes (accurate eyelid tracking); fall back to
+    # the downscaled landmarks when full-res analysis wasn't built.
+    shapes = ctx.full_shapes if ctx.full_shapes else ctx.landmarks
+    for small, shape in zip(ctx.frames_small, shapes):
         if shape is None:
             records.append((False, None))
             continue
@@ -255,7 +297,7 @@ def check_blink(ctx: LivenessContext) -> LayerResult:
         return LayerResult("blink", False, f"insufficient frames tracked ({len(records)})")
 
     margin = 0.08 if uses_68 else 0.15
-    ratio = 0.65 if uses_68 else 0.75
+    ratio = 0.8 if uses_68 else 0.8
     blinks, baseline = _detect_blinks(records, ratio, margin)
     ok = blinks >= 1
     present = sum(1 for p, _ in records if p)
@@ -307,23 +349,25 @@ def quick_yaw_swing(frames_raw: list[np.ndarray], engine, predictor,
 
 def quick_blink_count(frames_raw: list[np.ndarray], engine, predictor,
                       lowlight: bool, strength: float) -> int:
-    """Adaptive blink count over frames (for live feedback)."""
+    """Adaptive blink count over frames (for live feedback).
+
+    Uses full-res shapes for eyelid tracking accuracy on dim webcams."""
     smalls, _ = _prep_frames(frames_raw, lowlight, strength)
     rgb_smalls = [cv2.cvtColor(s, cv2.COLOR_BGR2RGB) for s in smalls]
     boxes = [_largest(engine.detect(r)) for r in rgb_smalls]
-    shapes = build_landmark_sets(rgb_smalls, boxes, predictor)
+    shapes = build_full_shapes(frames_raw, boxes, smalls, predictor)
     records: list[tuple[bool, float | None]] = []
     uses_68 = False
-    for sm, shape in zip(smalls, shapes):
+    for shape in shapes:
         if shape is None:
             records.append((False, None))
             continue
         if is_68_point(shape):
             uses_68 = True
-        s = openness_score(shape, cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY))
+        s = openness_score(shape, None)
         records.append((True, s))
     margin = 0.08 if uses_68 else 0.15
-    ratio = 0.65 if uses_68 else 0.75
+    ratio = 0.8 if uses_68 else 0.8
     blinks, _ = _detect_blinks(records, ratio, margin)
     return blinks
 
@@ -556,6 +600,8 @@ def run_liveness(
                           full_res_frames=[full_mid] if full_mid is not None else [],
                           scale=scales[mid] if scales else 1.0)
     ctx.landmarks = build_landmark_sets(rgb_smalls, boxes, predictor)
+    if layers_cfg.get("blink", True):
+        ctx.full_shapes = build_full_shapes(frames_raw, boxes, smalls, predictor)
 
     results: list[LayerResult] = []
     if layers_cfg.get("blink", True):

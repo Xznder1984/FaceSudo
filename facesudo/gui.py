@@ -15,6 +15,7 @@ from __future__ import annotations
 import sys
 
 import cv2
+import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -55,6 +56,14 @@ def _bgr_to_pixmap(frame) -> QPixmap:
     h, w, ch = rgb.shape
     qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
+
+
+def _brighten_display(frame, gamma: float = 0.7) -> np.ndarray:
+    """Display-only gamma lift so the live preview stays visible in dim
+    light. Analysis/recognition never sees this path."""
+    g = frame.astype(np.float32) / 255.0
+    g = np.power(np.clip(g, 0.0, 1.0), gamma)
+    return (g * 255.0).astype(np.uint8)
 
 
 def _engine_brief() -> str:
@@ -489,6 +498,7 @@ class MatchWindow(QDialog):
 
         self.setWindowTitle("FaceSudo - guided match")
         self.resize(580, 560)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
         layout = QVBoxLayout(self)
 
@@ -537,6 +547,7 @@ class MatchWindow(QDialog):
             if yaw is not None:
                 cv2.putText(display, f"yaw {yaw:+.2f}", (left, top - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        display = _brighten_display(display)
         self.preview.setPixmap(_bgr_to_pixmap(display).scaled(
             self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
@@ -551,6 +562,8 @@ class MatchWindow(QDialog):
 
     def _on_done(self, result) -> None:
         self.result = result
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+        self.show()
         if result.ok:
             self.step.setText("MATCHED")
             self.feedback.setText(f"{result.reason}\n{result.summary()}")
@@ -585,6 +598,9 @@ def run_match_dialog(cfg: Config):
     if app is None:
         app = QApplication(sys.argv)
     win = MatchWindow(cfg)
+    win.show()
+    win.raise_()
+    win.activateWindow()
     win.exec()
     return win.result
 

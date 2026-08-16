@@ -28,7 +28,6 @@ from .liveness import (
     LIVENESS_WIDTH,
     LayerResult,
     _yaw_of_shape,
-    is_68_point,
     openness_score,
     run_liveness,
 )
@@ -138,6 +137,27 @@ def _shape_of(rgb, box, predictor):
         return None
 
 
+def _full_shape(frame_bgr, sm, box, predictor):
+    """68-pt shape on the full-res frame, mapped from a small-frame box.
+
+    Blink analysis needs the full-res landmarks: on a dim webcam the
+    downscaled predictor returns a near-fixed eye template that never moves
+    during a blink."""
+    import dlib
+
+    if box is None:
+        return None
+    top, right, bottom, left = box
+    sx = frame_bgr.shape[1] / sm.shape[1]
+    sy = frame_bgr.shape[0] / sm.shape[0]
+    try:
+        return predictor(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB),
+                         dlib.rectangle(int(left * sx), int(top * sy),
+                                        int(right * sx), int(bottom * sy)))
+    except Exception:
+        return None
+
+
 class _LiveBlinkCounter:
     """Streaming blink counter: EAR-dip around a running median baseline OR a
     transient landmark-detection gap (the landmark detector drops frames
@@ -172,7 +192,8 @@ class _LiveBlinkCounter:
         valid = [s for p, s in self.records if p and s is not None]
         if len(valid) < 3:
             return None
-        baseline = float(np.median(valid))
+        hi = sorted(valid)
+        baseline = float(np.median(hi[len(hi) // 2:]))
         closed = max(baseline - self.margin, baseline * self.ratio)
         reopen = closed + (baseline - closed) * 0.5
         s = score
@@ -248,7 +269,7 @@ def run_match_with_session(
 
     try:
         # --- Face hunt: live preview until a face appears ---
-        session.prompt("camera on - looking for your face...")
+        session.prompt("camera on - SIT UP and face the camera (full face in frame)")
         face_box = None
         while time.monotonic() < deadline:
             if session.cancelled():
@@ -272,20 +293,18 @@ def run_match_with_session(
         session.feedback("face found")
 
         # --- Phase A: blink / texture / micro-motion window (live feedback) ---
-        session.prompt("Now blink naturally a few times")
+        session.prompt("Now blink TWICE slowly: open... close... open... close")
         counter = None
 
         def _on_a(frame):
             nonlocal counter
-            sm, box, _, shape = _annotate(frame, engine, predictor, lowlight, strength)
+            sm, box, _, _ = _annotate(frame, engine, predictor, lowlight, strength)
             session.preview(sm, box)
-            if shape is None:
-                return
             if counter is None:
-                counter = _LiveBlinkCounter(0.65 if is_68_point(shape) else 0.75,
-                                            0.08 if is_68_point(shape) else 0.15)
+                counter = _LiveBlinkCounter(0.8, 0.08)
+            shape = _full_shape(frame, sm, box, predictor)
             present = shape is not None
-            gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             score = openness_score(shape, gray) if present else None
             new = counter.feed(present, score)
             if new:
@@ -294,9 +313,9 @@ def run_match_with_session(
         def _stop_a():
             return counter is not None and counter.total >= 2
 
-        frames_a = _capture_burst(cam, 14, delay=0.03,
-                                  deadline=_phase_deadline(14, 0.03),
-                                  on_frame=_on_a, stop=_stop_a, stop_min=8)
+        frames_a = _capture_burst(cam, 40, delay=0.02,
+                                  deadline=time.monotonic() + 7.0,
+                                  on_frame=_on_a, stop=_stop_a, stop_min=6)
         if session.cancelled():
             result.reason = "cancelled by user"
             return result

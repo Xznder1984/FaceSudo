@@ -74,10 +74,17 @@ MARKER_OUT="# <<< FaceSudo <<<"
 
 read -r -d '' BLOCK <<EOF || true
 $MARKER_IN
+# FaceSudo: face-recognition sudo (only intercepts real \`sudo cmd\` calls)
 export PATH="\$HOME/.facesudo/bin:\$PATH"
 sudo() {
   if [[ -z "\$FACESUDO_NO" && -t 0 ]] && command -v facesudo-auth >/dev/null 2>&1; then
-    if ! /usr/bin/sudo -n true 2>/dev/null; then
+    # Skip flag-only invocations (e.g. \`sudo -k\`, \`sudo -v\`) -- there is
+    # no command to authenticate.
+    local arg has_cmd=0
+    for arg in "\$@"; do
+      [[ "\$arg" == -* ]] || { has_cmd=1; break; }
+    done
+    if [[ "\$has_cmd" == 1 ]] && ! /usr/bin/sudo -n true 2>/dev/null; then
       facesudo-auth "\$@"
       return \$?
     fi
