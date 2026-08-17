@@ -509,7 +509,7 @@ def check_micro_motion(ctx: LivenessContext) -> LayerResult:
     mean_ratio = float(np.mean(internal_stds))
     if any_motion < no_motion:
         return LayerResult("micro_motion", False, f"no motion detected ({any_motion:.3f})")
-    if mean_ratio < 0.35 and any_motion > rigid_motion:
+    if mean_ratio < 0.20 and any_motion > rigid_motion:
         return LayerResult("micro_motion", False, f"rigid/uniform motion (ratio={mean_ratio:.2f})")
     return LayerResult("micro_motion", True, f"flow ratio={mean_ratio:.2f} motion={any_motion:.2f}")
 
